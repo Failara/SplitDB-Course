@@ -6,6 +6,7 @@ from datetime import datetime
 from kafka import KafkaConsumer
 from cassandra.cluster import Cluster
 from cassandra.query import BatchStatement, SimpleStatement
+import logging
 
 KAFKA_BROKERS = ['kafka:29092']
 CASSANDRA_HOSTS = ['cassandra']
@@ -14,36 +15,51 @@ KEYSPACE = 'bess_market'
 CYCLES_TOPIC = 'bess.cycles.calculated'
 TX_LOG_TOPIC = 'bess.transaction.log'
 
-def connect_to_cassandra():
-    try:
-        cluster = Cluster(CASSANDRA_HOSTS)
-        session = cluster.connect()
-        print("Cassandra connected successfully.")
-        return cluster, session
-    except Exception as e:
-        print(f"Failed to connect to Cassandra: {e}. Retrying...")
-        time.sleep(5)
-        return connect_to_cassandra()
+# configure structured logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("cassandra_writer")
 
-def connect_to_kafka(topic, group_id):
-    try:
-        consumer = KafkaConsumer(
-            topic,
-            bootstrap_servers=KAFKA_BROKERS,
-            group_id=group_id,
-            auto_offset_reset='earliest',
-            value_deserializer=lambda v: json.loads(v.decode('utf-8'))
-        )
-        print(f"Kafka consumer for topic '{topic}' connected.")
-        return consumer
-    except Exception as e:
-        print(f"Failed to connect Kafka consumer for '{topic}': {e}. Retrying...")
-        time.sleep(5)
-        return connect_to_kafka(topic, group_id)
+def connect_to_cassandra(retries=5, backoff_secs=5):
+    attempt = 0
+    while True:
+        try:
+            cluster = Cluster(CASSANDRA_HOSTS)
+            session = cluster.connect()
+            logger.info("Cassandra connected successfully.")
+            return cluster, session
+        except Exception as e:
+            attempt += 1
+            logger.warning("Failed to connect to Cassandra: %s. Attempt %d", e, attempt)
+            if retries and attempt >= retries:
+                logger.error("Exceeded Cassandra connection retries.")
+                raise
+            time.sleep(backoff_secs)
+
+def connect_to_kafka(topic, group_id, retries=5, backoff_secs=5):
+    attempt = 0
+    while True:
+        try:
+            consumer = KafkaConsumer(
+                topic,
+                bootstrap_servers=KAFKA_BROKERS,
+                group_id=group_id,
+                auto_offset_reset='earliest',
+                value_deserializer=lambda v: json.loads(v.decode('utf-8')) if v is not None else None,
+                enable_auto_commit=True
+            )
+            logger.info("Kafka consumer for topic '%s' connected.", topic)
+            return consumer
+        except Exception as e:
+            attempt += 1
+            logger.warning("Failed to connect Kafka consumer for '%s': %s. Attempt %d", topic, e, attempt)
+            if retries and attempt >= retries:
+                logger.error("Exceeded Kafka consumer connection retries for topic %s.", topic)
+                raise
+            time.sleep(backoff_secs)
 
 def create_schema(session):
     try:
-        print("Creating keyspace 'bess_market' (if not exists)...")
+        logger.info("Creating keyspace 'bess_market' (if not exists)...")
         session.execute(f"""
             CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
             WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}};
@@ -51,7 +67,7 @@ def create_schema(session):
         
         session.set_keyspace(KEYSPACE)
 
-        print("Creating table 'cycle_sessions' (if not exists)...")
+        logger.info("Creating table 'cycle_sessions' (if not exists)...")
         session.execute("""
             CREATE TABLE IF NOT EXISTS cycle_sessions (
                 bess_id text,
@@ -65,7 +81,7 @@ def create_schema(session):
             ) WITH CLUSTERING ORDER BY (cycle_end_time DESC);
         """)
 
-        print("Creating table 'market_settlement' (if not exists)...")
+        logger.info("Creating table 'market_settlement' (if not exists)...")
         session.execute("""
             CREATE TABLE IF NOT EXISTS market_settlement (
                 tx_id uuid PRIMARY KEY,
@@ -78,7 +94,7 @@ def create_schema(session):
             );
         """)
 
-        print("Creating table 'transaction_log' (if not exists)...")
+        logger.info("Creating table 'transaction_log' (if not exists)...")
         session.execute("""
             CREATE TABLE IF NOT EXISTS transaction_log (
                 tx_id uuid PRIMARY KEY,
@@ -88,13 +104,13 @@ def create_schema(session):
                 event_time timestamp
             );
         """)
-        print("Schema created successfully.")
+        logger.info("Schema created successfully.")
     except Exception as e:
-        print(f"CRITICAL ERROR: Failed to create schema: {e}")
+        logger.exception("CRITICAL ERROR: Failed to create schema: %s", e)
         raise
 
 def writer_tx_log(consumer, session):
-    print(f"Starting Transaction Log Writer...")
+    logger.info("Starting Transaction Log Writer...")
     try:
         query = session.prepare("""
             INSERT INTO transaction_log (tx_id, coordinator_node, status, details, event_time)
@@ -103,23 +119,27 @@ def writer_tx_log(consumer, session):
         
         for message in consumer:
             log = message.value
+            if not log:
+                continue
             try:
+                tx_uuid = uuid.UUID(log['tx_id']) if isinstance(log.get('tx_id'), str) else log.get('tx_id')
+                event_time = datetime.fromisoformat(log['event_time']) if isinstance(log.get('event_time'), str) else log.get('event_time')
                 session.execute(query, (
-                    uuid.UUID(log['tx_id']),
-                    log['coordinator_node'],
-                    log['status'],
-                    log['details'],
-                    datetime.fromisoformat(log['event_time'])
+                    tx_uuid,
+                    log.get('coordinator_node'),
+                    log.get('status'),
+                    log.get('details'),
+                    event_time
                 ))
-                print(f"[LogWriter]: Saved TX {log['tx_id']} with status {log['status']}")
+                logger.info("[LogWriter]: Saved TX %s with status %s", log.get('tx_id'), log.get('status'))
             except Exception as e:
-                print(f"[LogWriter] Error writing log: {e}")
+                logger.exception("[LogWriter] Error writing log: %s", e)
     except Exception as e:
-        print(f"[LogWriter] Thread failed to prepare query: {e}")
+        logger.exception("[LogWriter] Thread failed to prepare query: %s", e)
 
 
 def writer_settlements(consumer, session):
-    print(f"Starting Settlements Writer...")
+    logger.info("Starting Settlements Writer...")
     try:
         query_p1 = session.prepare("""
             INSERT INTO cycle_sessions (bess_id, cycle_end_time, cycle_start_time, total_charged, total_discharged, roundtrip_efficiency, tx_id)
@@ -133,66 +153,80 @@ def writer_settlements(consumer, session):
     
         for message in consumer:
             settlement = message.value
-            tx_id = uuid.UUID(settlement['tx_id'])
-            print(f"[SettlementWriter]: Processing COMMIT for TX {tx_id}...")
-            
+            if not settlement:
+                continue
             try:
+                tx_id = uuid.UUID(settlement['tx_id']) if isinstance(settlement.get('tx_id'), str) else settlement.get('tx_id')
+                logger.info("[SettlementWriter]: Processing COMMIT for TX %s...", tx_id)
+                
                 batch = BatchStatement()
                 
                 batch.add(query_p1, (
-                    settlement['bess_id'],
+                    settlement.get('bess_id'),
                     datetime.fromisoformat(settlement['end_time']),
                     datetime.fromisoformat(settlement['start_time']),
-                    settlement['total_charged_wh'],
-                    settlement['total_discharged_wh'],
-                    settlement['roundtrip_efficiency'],
+                    settlement.get('total_charged_wh'),
+                    settlement.get('total_discharged_wh'),
+                    settlement.get('roundtrip_efficiency'),
                     tx_id
                 ))
                 
                 batch.add(query_p2, (
                     tx_id,
-                    settlement['bess_id'],
+                    settlement.get('bess_id'),
                     datetime.fromisoformat(settlement['end_time']),
                     "simulated_service",
-                    settlement['committed_energy'],
-                    settlement['delivered_energy'],
-                    settlement['payout_amount']
+                    settlement.get('committed_energy'),
+                    settlement.get('delivered_energy'),
+                    settlement.get('payout_amount')
                 ))
                 
                 session.execute(batch)
-                print(f"[SettlementWriter]: SUCCESSFULLY committed TX {tx_id} to Cassandra.")
+                logger.info("[SettlementWriter]: SUCCESSFULLY committed TX %s to Cassandra.", tx_id)
                 
             except KeyError as e:
-                print(f"[SettlementWriter] CRITICAL KEY ERROR: Failed to write BATCH for TX {tx_id}. Missing key: {e}")
+                logger.exception("[SettlementWriter] CRITICAL KEY ERROR: Missing key: %s", e)
             except Exception as e:
-                print(f"[SettlementWriter] CRITICAL ERROR: Failed to write BATCH for TX {tx_id}: {e}")
+                logger.exception("[SettlementWriter] CRITICAL ERROR: Failed to write BATCH for TX: %s", e)
     except Exception as e:
-        print(f"[SettlementWriter] Thread failed to prepare query: {e}")
+        logger.exception("[SettlementWriter] Thread failed to prepare query: %s", e)
 
 
 if __name__ == "__main__":
-    print("Starting Cassandra Writers... waiting 20s for services.")
+    logger.info("Starting Cassandra Writers... waiting 20s for services.")
     time.sleep(20)
     
-    cluster, session = connect_to_cassandra()
-    
+    cluster = session = None
+    log_consumer = settlement_consumer = None
     try:
+        cluster, session = connect_to_cassandra()
         create_schema(session)
-    except Exception as e:
-        print("Could not create schema. Exiting.")
-        exit(1)
     
-    log_consumer = connect_to_kafka(TX_LOG_TOPIC, "cassandra-log-writer-group")
-    log_thread = threading.Thread(target=writer_tx_log, args=(log_consumer, session), daemon=True)
-    
-    settlement_consumer = connect_to_kafka(CYCLES_TOPIC, "cassandra-settlement-writer-group")
-    settlement_thread = threading.Thread(target=writer_settlements, args=(settlement_consumer, session), daemon=True)
+        log_consumer = connect_to_kafka(TX_LOG_TOPIC, "cassandra-log-writer-group")
+        log_thread = threading.Thread(target=writer_tx_log, args=(log_consumer, session), daemon=True)
+        
+        settlement_consumer = connect_to_kafka(CYCLES_TOPIC, "cassandra-settlement-writer-group")
+        settlement_thread = threading.Thread(target=writer_settlements, args=(settlement_consumer, session), daemon=True)
 
-    log_thread.start()
-    settlement_thread.start()
-    
-    print("Writers are running.")
-    log_thread.join()
-    settlement_thread.join()
-    
-    cluster.shutdown()
+        log_thread.start()
+        settlement_thread.start()
+        
+        logger.info("Writers are running.")
+        # Wait until interrupted
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutdown requested (KeyboardInterrupt).")
+    except Exception as e:
+        logger.exception("Fatal error in main: %s", e)
+    finally:
+        try:
+            if log_consumer:
+                log_consumer.close()
+            if settlement_consumer:
+                settlement_consumer.close()
+            if cluster:
+                cluster.shutdown()
+            logger.info("Clean shutdown complete.")
+        except Exception:
+            logger.exception("Error during shutdown.")

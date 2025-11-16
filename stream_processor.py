@@ -2,6 +2,7 @@ import json
 import uuid
 import random
 from datetime import datetime, timedelta, timezone
+import logging
 
 from kafka_connectors import KafkaSource, KafkaSink 
 from bytewax.dataflow import Dataflow
@@ -16,8 +17,18 @@ CYCLES_OUTPUT_TOPIC = "bess.cycles.calculated"
 TX_LOG_OUTPUT_TOPIC = "bess.transaction.log"
 SESSION_GAP_SEC = 30
 
+logger = logging.getLogger("stream_processor")
+
 def get_timestamp(reading):
-    return datetime.fromisoformat(reading['timestamp']).replace(tzinfo=timezone.utc)
+    ts_val = reading.get('timestamp')
+    if not ts_val:
+        return datetime.now(timezone.utc)
+    try:
+        # handle both aware and naive ISO strings
+        return datetime.fromisoformat(ts_val).replace(tzinfo=timezone.utc)
+    except Exception as e:
+        logger.warning("Invalid timestamp '%s' for reading %s: %s. Using now()", ts_val, reading.get('bess_id'), e)
+        return datetime.now(timezone.utc)
 
 clock = EventClock(get_timestamp, wait_for_system_duration=timedelta(seconds=5))
 window = SessionWindower(gap=timedelta(seconds=SESSION_GAP_SEC))
@@ -146,13 +157,20 @@ flow = Dataflow("bess_processor")
 stream = op.input("kafka_in", flow, KafkaSource(KAFKA_BROKERS, INPUT_TOPIC, group_id="bytewax_bess_reader"))
 
 def deserialize(key_bytes_tuple):
-    key, value_bytes = key_bytes_tuple
-    if value_bytes is None:
+    if key_bytes_tuple is None:
         return None
     try:
-        return key, json.loads(value_bytes.decode('utf-8'))
+        key, value_bytes = key_bytes_tuple
+        if value_bytes is None:
+            return None
+        # value_bytes might already be a dict (if connector deserialized) or bytes
+        if isinstance(value_bytes, (bytes, bytearray)):
+            value = json.loads(value_bytes.decode('utf-8'))
+        else:
+            value = value_bytes
+        return key, value
     except Exception as e:
-        print(f"Deserialization error: {e}, Value: {value_bytes}")
+        logger.exception("Deserialization error: %s. Raw: %s", e, key_bytes_tuple)
         return None
 stream_deserialized = op.filter_map("deserialize", stream, deserialize)
 

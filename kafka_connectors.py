@@ -2,6 +2,9 @@ from bytewax.inputs import StatefulSourcePartition, FixedPartitionedSource
 from bytewax.outputs import StatefulSinkPartition, FixedPartitionedSink
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 import json
+import logging
+
+logger = logging.getLogger("kafka_connectors")
 
 class KafkaSourcePartition(StatefulSourcePartition):
     def __init__(self, consumer, topic, partition):
@@ -12,18 +15,25 @@ class KafkaSourcePartition(StatefulSourcePartition):
         self.consumer.assign([tp])
 
     def next_batch(self):
-        messages = self.consumer.poll(timeout_ms=1000, max_records=100)
-        batch = []
-        for tp, msgs in messages.items():
-            for msg in msgs:
-                batch.append((msg.key, msg.value))
-        return batch
+        try:
+            messages = self.consumer.poll(timeout_ms=1000, max_records=100)
+            batch = []
+            for tp, msgs in messages.items():
+                for msg in msgs:
+                    batch.append((msg.key, msg.value))
+            return batch
+        except Exception as e:
+            logger.exception("Error polling Kafka: %s", e)
+            return []
 
     def snapshot(self):
         return None
 
     def close(self):
-        self.consumer.close()
+        try:
+            self.consumer.close()
+        except Exception:
+            logger.exception("Error closing consumer")
 
 class KafkaSource(FixedPartitionedSource):
     def __init__(self, brokers, topic, group_id='bytewax-group', offset='latest'):
@@ -37,12 +47,13 @@ class KafkaSource(FixedPartitionedSource):
         if self._partitions is None:
             temp_consumer = KafkaConsumer(
                 bootstrap_servers=self.brokers,
-                group_id=f"{self.group_id}-temp-list"
+                group_id=f"{self.group_id}-temp-list",
+                enable_auto_commit=False
             )
             partitions = temp_consumer.partitions_for_topic(self.topic)
             temp_consumer.close()
             if partitions:
-                self._partitions = [f"partition-{p}" for p in partitions]
+                self._partitions = [f"partition-{p}" for p in sorted(partitions)]
             else:
                 self._partitions = ["partition-0"]
         return self._partitions
@@ -53,7 +64,8 @@ class KafkaSource(FixedPartitionedSource):
             bootstrap_servers=self.brokers,
             group_id=self.group_id,
             auto_offset_reset=self.offset,
-            enable_auto_commit=True
+            enable_auto_commit=False,
+            consumer_timeout_ms=1000
         )
         return KafkaSourcePartition(consumer, self.topic, partition_num)
 
@@ -71,24 +83,35 @@ class KafkaSinkPartition(StatefulSinkPartition):
                     key = None
                     value = item
                 
-                if key and isinstance(key, str):
+                # normalize key to bytes
+                if key is not None and isinstance(key, str):
                     key = key.encode('utf-8')
-                
+                elif key is None:
+                    key = None
+
+                # normalize value to bytes
                 if isinstance(value, (dict, list)):
                     value = json.dumps(value, default=str).encode('utf-8')
                 elif isinstance(value, str):
                     value = value.encode('utf-8')
-                
+                # if it's already bytes, leave as-is
+
                 self.producer.send(self.topic, key=key, value=value)
             except Exception as e:
-                print(f"Error writing to Kafka: {e}")
-        self.producer.flush()
+                logger.exception("Error writing to Kafka: %s", e)
+        try:
+            self.producer.flush()
+        except Exception:
+            logger.exception("Error flushing Kafka producer")
 
     def snapshot(self):
         return None
 
     def close(self):
-        self.producer.close()
+        try:
+            self.producer.close()
+        except Exception:
+            logger.exception("Error closing producer")
 
 class KafkaSink(FixedPartitionedSink):
     def __init__(self, brokers, topic):
