@@ -159,12 +159,21 @@ def writer_settlements(consumer, session):
                 tx_id = uuid.UUID(settlement['tx_id']) if isinstance(settlement.get('tx_id'), str) else settlement.get('tx_id')
                 logger.info("[SettlementWriter]: Processing COMMIT for TX %s...", tx_id)
                 
+                # Parse timestamps safely
+                end_time = settlement['end_time']
+                if isinstance(end_time, str):
+                    end_time = datetime.fromisoformat(end_time)
+                
+                start_time = settlement['start_time']
+                if isinstance(start_time, str):
+                    start_time = datetime.fromisoformat(start_time)
+                
                 batch = BatchStatement()
                 
                 batch.add(query_p1, (
                     settlement.get('bess_id'),
-                    datetime.fromisoformat(settlement['end_time']),
-                    datetime.fromisoformat(settlement['start_time']),
+                    end_time,
+                    start_time,
                     settlement.get('total_charged_wh'),
                     settlement.get('total_discharged_wh'),
                     settlement.get('roundtrip_efficiency'),
@@ -174,7 +183,7 @@ def writer_settlements(consumer, session):
                 batch.add(query_p2, (
                     tx_id,
                     settlement.get('bess_id'),
-                    datetime.fromisoformat(settlement['end_time']),
+                    end_time,
                     "simulated_service",
                     settlement.get('committed_energy'),
                     settlement.get('delivered_energy'),

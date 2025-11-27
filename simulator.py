@@ -6,24 +6,42 @@ from datetime import datetime, timezone
 from kafka import KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
+import logging
+import signal
+import sys
 
 KAFKA_BROKERS = ['kafka:29092']
 KAFKA_TOPIC = 'bess.raw.data'
 NUM_BESS = 25
 SEND_INTERVAL_SEC = 1
 
-def create_kafka_topics():
-    try:
-        admin_client = KafkaAdminClient(
-            bootstrap_servers=KAFKA_BROKERS,
-            client_id='topic_creator'
-        )
-        print("Kafka AdminClient connected successfully.")
-    except Exception as e:
-        print(f"Failed to connect Kafka AdminClient: {e}. Retrying...")
-        time.sleep(5)
-        create_kafka_topics()
-        return
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("simulator")
+
+shutdown_event = threading.Event()
+
+def signal_handler(sig, frame):
+    logger.info("Shutdown signal received. Stopping simulator...")
+    shutdown_event.set()
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+def create_kafka_topics(retries=5):
+    for attempt in range(1, retries + 1):
+        try:
+            admin_client = KafkaAdminClient(
+                bootstrap_servers=KAFKA_BROKERS,
+                client_id='topic_creator'
+            )
+            logger.info("Kafka AdminClient connected successfully.")
+            break
+        except Exception as e:
+            logger.warning("Failed to connect Kafka AdminClient (attempt %d/%d): %s", attempt, retries, e)
+            if attempt >= retries:
+                logger.error("Exceeded AdminClient connection retries.")
+                raise
+            time.sleep(5)
 
     topic_list = [
         NewTopic(name="bess.raw.data", num_partitions=2, replication_factor=1),
@@ -33,26 +51,31 @@ def create_kafka_topics():
 
     try:
         admin_client.create_topics(new_topics=topic_list, validate_only=False)
-        print("Topics created successfully (or were skipped).")
+        logger.info("Topics created successfully.")
     except TopicAlreadyExistsError:
-        print("Topics already exist, skipping creation.")
+        logger.info("Topics already exist, skipping creation.")
     except Exception as e:
-        print(f"An error occurred while creating topics: {e}")
+        logger.exception("Error creating topics: %s", e)
     finally:
         admin_client.close()
 
-def create_producer():
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BROKERS,
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-        print("Kafka Producer connected successfully.")
-        return producer
-    except Exception as e:
-        print(f"Failed to connect Kafka Producer: {e}")
-        time.sleep(5)
-        return create_producer()
+def create_producer(retries=5):
+    for attempt in range(1, retries + 1):
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BROKERS,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                acks='all',
+                retries=3
+            )
+            logger.info("Kafka Producer connected successfully.")
+            return producer
+        except Exception as e:
+            logger.warning("Failed to connect Kafka Producer (attempt %d/%d): %s", attempt, retries, e)
+            if attempt >= retries:
+                logger.error("Exceeded Producer connection retries.")
+                raise
+            time.sleep(5)
 
 def generate_bess_reading(bess_id, state):
     power = random.uniform(45.0, 50.0) if state == "charge" else random.uniform(-50.0, -45.0)
@@ -70,51 +93,78 @@ def generate_bess_reading(bess_id, state):
         'grid_frequency': random.uniform(49.9, 50.1)
     }
 
-def simulate_cycle(bess_id):
-    print(f"[{bess_id}] Starting CHARGE cycle...")
+def simulate_cycle(bess_id, producer):
+    logger.info("[%s] Starting CHARGE cycle...", bess_id)
     for _ in range(random.randint(10, 20)):
+        if shutdown_event.is_set():
+            return
         reading = generate_bess_reading(bess_id, "charge")
-        producer.send(KAFKA_TOPIC, reading, key=bess_id.encode('utf-8'))
-        time.sleep(SEND_INTERVAL_SEC)
-
-    gap_time = random.uniform(31, 35)
-    print(f"[{bess_id}] Entering GAP for {gap_time:.1f}s to trigger SessionWindow...")
-    time.sleep(gap_time)
-    
-    print(f"[{bess_id}] Starting DISCHARGE cycle...")
-    for _ in range(random.randint(10, 20)):
-        reading = generate_bess_reading(bess_id, "discharge")
-        producer.send(KAFKA_TOPIC, reading, key=bess_id.encode('utf-8'))
-        time.sleep(SEND_INTERVAL_SEC)
-    
-    gap_time = random.uniform(31, 35)
-    print(f"[{bess_id}] Entering GAP for {gap_time:.1f}s...")
-    time.sleep(gap_time)
-
-def run_simulator_for_bess(bess_id):
-    while True:
         try:
-            simulate_cycle(bess_id)
+            producer.send(KAFKA_TOPIC, reading, key=bess_id.encode('utf-8'))
         except Exception as e:
-            print(f"Error in simulator thread {bess_id}: {e}")
-            time.sleep(5)
+            logger.exception("[%s] Error sending message: %s", bess_id, e)
+        time.sleep(SEND_INTERVAL_SEC)
+
+    gap_time = random.uniform(31, 35)
+    logger.info("[%s] Entering GAP for %.1fs to trigger SessionWindow...", bess_id, gap_time)
+    shutdown_event.wait(gap_time)
+    if shutdown_event.is_set():
+        return
+    
+    logger.info("[%s] Starting DISCHARGE cycle...", bess_id)
+    for _ in range(random.randint(10, 20)):
+        if shutdown_event.is_set():
+            return
+        reading = generate_bess_reading(bess_id, "discharge")
+        try:
+            producer.send(KAFKA_TOPIC, reading, key=bess_id.encode('utf-8'))
+        except Exception as e:
+            logger.exception("[%s] Error sending message: %s", bess_id, e)
+        time.sleep(SEND_INTERVAL_SEC)
+    
+    gap_time = random.uniform(31, 35)
+    logger.info("[%s] Entering GAP for %.1fs...", bess_id, gap_time)
+    shutdown_event.wait(gap_time)
+
+def run_simulator_for_bess(bess_id, producer):
+    while not shutdown_event.is_set():
+        try:
+            simulate_cycle(bess_id, producer)
+        except Exception as e:
+            logger.exception("Error in simulator thread %s: %s", bess_id, e)
+            shutdown_event.wait(5)
 
 if __name__ == "__main__":
-    print("Simulator starting... waiting 10s for Kafka cluster.")
+    logger.info("Simulator starting... waiting 10s for Kafka cluster.")
     time.sleep(10)
     
-    create_kafka_topics()
+    try:
+        create_kafka_topics()
+        producer = create_producer()
+        
+        threads = []
+        for i in range(1, NUM_BESS + 1):
+            bess_id = f'BESS_{i:03d}'
+            thread = threading.Thread(target=run_simulator_for_bess, args=(bess_id, producer), daemon=True)
+            threads.append(thread)
+            thread.start()
+            time.sleep(random.uniform(0.5, 2.0))
 
-    producer = create_producer()
-    
-    threads = []
-    for i in range(1, NUM_BESS + 1):
-        bess_id = f'BESS_{i:03d}'
-        thread = threading.Thread(target=run_simulator_for_bess, args=(bess_id,), daemon=True)
-        threads.append(thread)
-        thread.start()
-        time.sleep(random.uniform(0.5, 2.0))
-
-    print(f"Launched {NUM_BESS} BESS simulator threads.")
-    for t in threads:
-        t.join()
+        logger.info("Launched %d BESS simulator threads.", NUM_BESS)
+        
+        # Wait for shutdown signal
+        while not shutdown_event.is_set():
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received.")
+        shutdown_event.set()
+    except Exception as e:
+        logger.exception("Fatal error in simulator: %s", e)
+    finally:
+        try:
+            if 'producer' in locals():
+                producer.close()
+            logger.info("Simulator shutdown complete.")
+        except Exception:
+            logger.exception("Error during shutdown.")

@@ -4,6 +4,7 @@ from kafka import KafkaConsumer, KafkaProducer, TopicPartition
 import json
 import logging
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("kafka_connectors")
 
 class KafkaSourcePartition(StatefulSourcePartition):

@@ -5,6 +5,11 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   kafka:
     image: confluentinc/cp-kafka:7.3.0
@@ -12,7 +17,8 @@ services:
     ports:
       - "9092:9092"
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
@@ -21,16 +27,40 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:29092",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
 
   cassandra:
     image: cassandra:4.0
     container_name: cassandra
     ports:
       - "9042:9042"
-    volumes:
-      - ./cassandra-schema.cql:/docker-entrypoint-initdb.d/init.cql
     environment:
       CASSANDRA_START_RPC: "true"
+      MAX_HEAP_SIZE: "512M"
+      HEAP_NEWSIZE: "128M"
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 2G
 
   simulator:
     build:
@@ -40,16 +70,21 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
 
   stream_processor:
     build:
       context: .
       dockerfile: Dockerfile.processor
     container_name: stream_processor
-    command: sh -c "echo 'Waiting 15s for Kafka...' && sleep 15 && echo 'Starting Bytewax...' && python -m bytewax.run stream_processor:flow -w 2"
+    environment:
+      - PYTHONUNBUFFERED=1
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
 
   cassandra_writer:
     build:
@@ -59,5 +94,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     depends_on:
-      - kafka
-      - cassandra
+      kafka:
+        condition: service_healthy
+      cassandra:
+        condition: service_healthy
+    restart: unless-stopped

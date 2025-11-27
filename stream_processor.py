@@ -4,6 +4,9 @@ import random
 from datetime import datetime, timedelta, timezone
 import logging
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("stream_processor")
+
 from kafka_connectors import KafkaSource, KafkaSink 
 from bytewax.dataflow import Dataflow
 from bytewax import operators as op
@@ -16,8 +19,6 @@ INPUT_TOPIC = "bess.raw.data"
 CYCLES_OUTPUT_TOPIC = "bess.cycles.calculated"
 TX_LOG_OUTPUT_TOPIC = "bess.transaction.log"
 SESSION_GAP_SEC = 30
-
-logger = logging.getLogger("stream_processor")
 
 def get_timestamp(reading):
     ts_val = reading.get('timestamp')
@@ -97,8 +98,8 @@ def calculate_efficiency(key_window_data):
     return {
         "bess_id": bess_id,
         "cycle_type": cycle_type,
-        "start_time": data["start_time"],
-        "end_time": data["end_time"],
+        "start_time": data["start_time"].isoformat() if data["start_time"] else None,
+        "end_time": data["end_time"].isoformat() if data["end_time"] else None,
         "total_charged_wh": data["charge_wh"],
         "total_discharged_wh": data["discharge_wh"],
         "roundtrip_efficiency": efficiency,
@@ -110,7 +111,7 @@ def run_2pc_coordinator(cycle_data):
         return {"settlement": None, "log": None}
 
     tx_id = str(uuid.uuid4())
-    print(f"[2PC Coord {tx_id}]: PREPARE for BESS {cycle_data['bess_id']}")
+    logger.info("[2PC Coord %s]: PREPARE for BESS %s", tx_id, cycle_data['bess_id'])
     
     delivered = cycle_data["total_discharged_wh"]
     committed = delivered * random.uniform(0.95, 1.05) 
@@ -126,7 +127,7 @@ def run_2pc_coordinator(cycle_data):
     vote_p2 = "VOTE_COMMIT" if market_service_ok else "VOTE_ABORT"
     details_p2 = "Market service validated" if market_service_ok else "Market service NOT FOUND"
 
-    print(f"[2PC Coord {tx_id}]: Votes: P1={vote_p1}, P2={vote_p2}")
+    logger.info("[2PC Coord %s]: Votes: P1=%s, P2=%s", tx_id, vote_p1, vote_p2)
     
     log_payload = {
         "tx_id": tx_id,
@@ -136,7 +137,7 @@ def run_2pc_coordinator(cycle_data):
     }
 
     if vote_p1 == "VOTE_COMMIT" and vote_p2 == "VOTE_COMMIT":
-        print(f"[2PC Coord {tx_id}]: GLOBAL_COMMIT")
+        logger.info("[2PC Coord %s]: GLOBAL_COMMIT", tx_id)
         log_payload["status"] = "GLOBAL_COMMIT"
         
         settlement_payload = {
@@ -148,7 +149,7 @@ def run_2pc_coordinator(cycle_data):
         }
         return {"settlement": settlement_payload, "log": log_payload}
     else:
-        print(f"[2PC Coord {tx_id}]: GLOBAL_ABORT")
+        logger.info("[2PC Coord %s]: GLOBAL_ABORT", tx_id)
         log_payload["status"] = "GLOBAL_ABORT"
         return {"settlement": None, "log": log_payload}
 
