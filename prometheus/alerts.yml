@@ -1,0 +1,32 @@
+groups:
+  - name: bess_economic_alerts
+    rules:
+      # 1. Арбітраж можливість: spread > 50 €/МВт-год
+      - alert: HighArbitrageOpportunity
+        expr: bess_arbitrage_spread > 50
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Високий потенціал для арбітражу"
+          description: "Спред цін становить {{ $value }} €, рекомендується розрядка."
+
+      # 2. Низький SOC під час низьких цін (втрачена можливість зарядитись)
+      - alert: LowSocAtLowPrice
+        expr: bess_market_price_eur_mwh < 40 and bess_soc_percent < 30
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Низький заряд при низькій ціні"
+          description: "Ціна впала до {{ $value }} €, але батарея розряджена. Потрібна негайна зарядка."
+
+      # 3. Витрати деградації перевищують прибуток (Економічна неефективність)
+      - alert: LossMakingOperation
+        expr: bess_daily_degradation_cost_eur > bess_daily_revenue_eur
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Збиткова робота BESS"
+          description: "Витрати на деградацію перевищують поточний прибуток."

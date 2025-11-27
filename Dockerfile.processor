@@ -1,7 +1,0 @@
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY kafka_connectors.py .
-COPY stream_processor.py ./
-CMD sh -c "echo 'Waiting 15s for Kafka to be ready...' && sleep 15 && echo 'Starting Bytewax processor...' && python -m bytewax.run stream_processor:flow -w 2"

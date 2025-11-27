@@ -1,3 +1,0 @@
-bytewax
-kafka-python
-cassandra-driver
