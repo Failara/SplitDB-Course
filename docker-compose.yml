@@ -1,29 +1,68 @@
-services:
-  # 1. Сервіс Бази Даних Cassandra
-  cassandra:
-    image: cassandra:4.1
-    container_name: cassandra-db
-    ports:
-      - "9042:9042" # Відкриваємо порт для підключення ззовні (напр. cqlsh)
-    healthcheck:
-      # Перевірка, чи Cassandra готова приймати запити
-      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES'"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
+version: "3.8"
 
-  # 2. Сервіс Python-додатку
-  python-app:
-    build:
-      context: . # Вказує Docker зібрати образ з Dockerfile у цій же папці
-      dockerfile: Dockerfile
-    container_name: python-bess-app
+services:
+  cassandra-seed:
+    image: cassandra:4.1
+    container_name: cassandra-seed
+    hostname: cassandra-seed
     environment:
-      - CASSANDRA_HOST=cassandra
-      - CASSANDRA_MAX_RETRIES=10
-      - CASSANDRA_RETRY_DELAY_SEC=2
-    # Цей сервіс почне працювати ТІЛЬКИ після того,
-    # як сервіс 'cassandra' пройде свою перевірку 'healthcheck'
+      - CASSANDRA_CLUSTER_NAME=BESS_Cluster
+      - CASSANDRA_DC=dc1
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - CASSANDRA_materialized_views_enabled=true
+    ports:
+      - "9042:9042"
+    volumes:
+      - ./cql:/cql
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  cassandra-dc1-node2:
+    image: cassandra:4.1
+    container_name: cassandra-dc1-node2
+    hostname: cassandra-dc1-node2
+    environment:
+      - CASSANDRA_CLUSTER_NAME=BESS_Cluster
+      - CASSANDRA_DC=dc1
+      - CASSANDRA_RACK=rack2
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - CASSANDRA_SEEDS=cassandra-seed
+      - CASSANDRA_materialized_views_enabled=true
     depends_on:
-      cassandra:
+      cassandra-seed:
         condition: service_healthy
+
+  cassandra-dc2-node1:
+    image: cassandra:4.1
+    container_name: cassandra-dc2-node1
+    hostname: cassandra-dc2-node1
+    environment:
+      - CASSANDRA_CLUSTER_NAME=BESS_Cluster
+      - CASSANDRA_DC=dc2
+      - CASSANDRA_RACK=rack1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - CASSANDRA_SEEDS=cassandra-seed
+      - CASSANDRA_materialized_views_enabled=true
+    depends_on:
+      cassandra-seed:
+        condition: service_healthy
+
+  python-tools:
+    image: python:3.11-slim
+    container_name: python-tools
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+      - ./requirements.txt:/app/requirements.txt
+    depends_on:
+      cassandra-seed:
+        condition: service_healthy
+      cassandra-dc1-node2:
+        condition: service_started
+      cassandra-dc2-node1:
+        condition: service_started
+    command: bash -c "pip install -r requirements.txt && tail -f /dev/null"
