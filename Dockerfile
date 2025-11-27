@@ -5,7 +5,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # 3. Встановлюємо необхідну бібліотеку
-RUN pip install cassandra-driver
+RUN pip install --no-cache-dir cassandra-driver
 
 # 4. Копіюємо наш скрипт у контейнер
 COPY lab2_bess.py .

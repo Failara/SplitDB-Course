@@ -1,12 +1,10 @@
 services:
   # 1. Сервіс Бази Даних Cassandra
   cassandra:
-    image: cassandra:latest
+    image: cassandra:4.1
     container_name: cassandra-db
     ports:
       - "9042:9042" # Відкриваємо порт для підключення ззовні (напр. cqlsh)
-    environment:
-      - CASSANDRA_START_RPC=true
     healthcheck:
       # Перевірка, чи Cassandra готова приймати запити
       test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES'"]
@@ -16,8 +14,14 @@ services:
 
   # 2. Сервіс Python-додатку
   python-app:
-    build: . # Вказує Docker зібрати образ з Dockerfile у цій же папці
+    build:
+      context: . # Вказує Docker зібрати образ з Dockerfile у цій же папці
+      dockerfile: Dockerfile
     container_name: python-bess-app
+    environment:
+      - CASSANDRA_HOST=cassandra
+      - CASSANDRA_MAX_RETRIES=10
+      - CASSANDRA_RETRY_DELAY_SEC=2
     # Цей сервіс почне працювати ТІЛЬКИ після того,
     # як сервіс 'cassandra' пройде свою перевірку 'healthcheck'
     depends_on:
