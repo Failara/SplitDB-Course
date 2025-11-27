@@ -1,37 +1,25 @@
 services:
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: zookeeper
+  # 1. Сервіс Бази Даних Cassandra
+  cassandra:
+    image: cassandra:latest
+    container_name: cassandra-db
     ports:
-      - "2181:2181"
+      - "9042:9042" # Відкриваємо порт для підключення ззовні (напр. cqlsh)
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+      - CASSANDRA_START_RPC=true
+    healthcheck:
+      # Перевірка, чи Cassandra готова приймати запити
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES'"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
 
-  kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: kafka
-    ports:
-      - "9092:9092"
-      - "29092:29092"
+  # 2. Сервіс Python-додатку
+  python-app:
+    build: . # Вказує Docker зібрати образ з Dockerfile у цій же папці
+    container_name: python-bess-app
+    # Цей сервіс почне працювати ТІЛЬКИ після того,
+    # як сервіс 'cassandra' пройде свою перевірку 'healthcheck'
     depends_on:
-      - zookeeper
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-
-  python-tools:
-    image: python:3.11-slim
-    container_name: python-tools
-    working_dir: /app
-    volumes:
-      - ./scripts:/app
-      - ./requirements.txt:/app/requirements.txt
-    depends_on:
-      - kafka
-    command: bash -c "pip install -r requirements.txt && tail -f /dev/null"
+      cassandra:
+        condition: service_healthy
