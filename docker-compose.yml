@@ -1,101 +1,37 @@
 services:
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.3.0
+    image: confluentinc/cp-zookeeper:7.5.0
     container_name: zookeeper
+    ports:
+      - "2181:2181"
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "2181"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   kafka:
-    image: confluentinc/cp-kafka:7.3.0
+    image: confluentinc/cp-kafka:7.5.0
     container_name: kafka
     ports:
       - "9092:9092"
+      - "29092:29092"
     depends_on:
-      zookeeper:
-        condition: service_healthy
+      - zookeeper
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "kafka-broker-api-versions",
-          "--bootstrap-server",
-          "localhost:29092",
-        ]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 1G
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
-  cassandra:
-    image: cassandra:4.0
-    container_name: cassandra
-    ports:
-      - "9042:9042"
-    environment:
-      CASSANDRA_START_RPC: "true"
-      MAX_HEAP_SIZE: "512M"
-      HEAP_NEWSIZE: "128M"
-    healthcheck:
-      test: ["CMD", "cqlsh", "-e", "describe keyspaces"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-
-  simulator:
-    build:
-      context: .
-      dockerfile: Dockerfile.simulator
-    container_name: simulator
-    environment:
-      - PYTHONUNBUFFERED=1
+  python-tools:
+    image: python:3.11-slim
+    container_name: python-tools
+    working_dir: /app
+    volumes:
+      - ./scripts:/app
+      - ./requirements.txt:/app/requirements.txt
     depends_on:
-      kafka:
-        condition: service_healthy
-    restart: unless-stopped
-
-  stream_processor:
-    build:
-      context: .
-      dockerfile: Dockerfile.processor
-    container_name: stream_processor
-    environment:
-      - PYTHONUNBUFFERED=1
-    depends_on:
-      kafka:
-        condition: service_healthy
-    restart: unless-stopped
-
-  cassandra_writer:
-    build:
-      context: .
-      dockerfile: Dockerfile.writer
-    container_name: cassandra_writer
-    environment:
-      - PYTHONUNBUFFERED=1
-    depends_on:
-      kafka:
-        condition: service_healthy
-      cassandra:
-        condition: service_healthy
-    restart: unless-stopped
+      - kafka
+    command: bash -c "pip install -r requirements.txt && tail -f /dev/null"
