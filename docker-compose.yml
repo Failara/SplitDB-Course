@@ -7,6 +7,13 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - kafka-network
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -15,7 +22,8 @@ services:
       - "9092:9092"
       - "29092:29092"
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
@@ -24,6 +32,21 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - kafka-network
 
   python-tools:
     image: python:3.11-slim
@@ -33,5 +56,12 @@ services:
       - ./scripts:/app
       - ./requirements.txt:/app/requirements.txt
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     command: bash -c "pip install -r requirements.txt && tail -f /dev/null"
+    networks:
+      - kafka-network
+
+networks:
+  kafka-network:
+    driver: bridge

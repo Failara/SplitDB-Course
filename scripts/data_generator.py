@@ -1,34 +1,65 @@
 import json
 import time
 import random
+import logging
+import signal
+import sys
 from datetime import datetime
+from typing import Tuple, Dict, Any
 from kafka import KafkaProducer
+from kafka.errors import KafkaError
 
-# Топіки для гібридного навантаження (Підваріант C)
-REALTIME_TOPIC = "bess-realtime-critical" # Для моніторингу частоти
-ANALYTICS_TOPIC = "bess-analytics-soc"    # Для аналітики заряду батарей
+from config import (
+    KAFKA_BOOTSTRAP_SERVERS, KAFKA_RETRIES, KAFKA_ACKS,
+    REALTIME_TOPIC, ANALYTICS_TOPIC, NUM_DEVICES,
+    REALTIME_PROBABILITY, MESSAGE_INTERVAL_SECONDS
+)
 
-def create_producer():
-    """Створюємо Kafka producer"""
-    print("🔌 Підключення до Kafka як Producer...")
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=['kafka:9092'],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            acks='all',
-            retries=5
-        )
-        print("✅ Producer готовий до роботи!")
-        return producer
-    except Exception as e:
-        print(f"❌ Помилка підключення Producer: {e}")
-        return None
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-def generate_bess_data(device_id):
-    """Генерує дані для однієї системи накопичення енергії (BESS)"""
-    # 70% часу система працює в режимі регулювання частоти (real-time)
-    # 30% - в інших режимах (аналітика)
-    is_realtime_mode = random.random() >= 0.7 
+# Global producer for graceful shutdown
+producer = None
+running = True
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global running
+    logger.info("Shutdown signal received. Cleaning up...")
+    running = False
+
+def create_producer() -> KafkaProducer:
+    """Create Kafka producer with retry logic"""
+    logger.info("🔌 Connecting to Kafka as Producer...")
+    max_attempts = 10
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            prod = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                acks=KAFKA_ACKS,
+                retries=KAFKA_RETRIES,
+                max_in_flight_requests_per_connection=5,
+                compression_type='gzip'
+            )
+            logger.info("✅ Producer ready!")
+            return prod
+        except KafkaError as e:
+            logger.warning(f"Attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                time.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logger.error("❌ Failed to connect Producer after all attempts")
+                raise
+
+def generate_bess_data(device_id: int) -> Tuple[Dict[str, Any], bool]:
+    """Generate data for a Battery Energy Storage System (BESS)"""
+    is_realtime_mode = random.random() < REALTIME_PROBABILITY
     
     if is_realtime_mode:
         mode = "frequency_regulation"
@@ -48,45 +79,70 @@ def generate_bess_data(device_id):
         "voltage": round(random.uniform(850.0, 1450.0), 2),
         "current": round(abs(power_output / 1000), 2),
         "status": random.choice(["charging", "discharging", "idle"]),
-        "location": {"lat": round(random.uniform(46.0, 52.0), 4), "lon": round(random.uniform(22.0, 40.0), 4)},
+        "location": {
+            "lat": round(random.uniform(46.0, 52.0), 4),
+            "lon": round(random.uniform(22.0, 40.0), 4)
+        },
         "maintenance_hours": random.randint(500, 15000),
-
         "soc": round(random.uniform(15.0, 85.0), 2),
         "grid_frequency": grid_frequency,
         "mode": mode
     }
     return data, is_realtime_mode
 
-def main():
-    producer = create_producer()
-    if not producer:
-        return
-
-    print("🚀 Починаємо відправку гібридного потоку даних BESS...")
-    msg_count = 0
+def send_message(producer: KafkaProducer, topic: str, data: Dict[str, Any]) -> bool:
+    """Send message with error handling"""
     try:
-        while True:
-            device_num = random.randint(1, 8)
+        future = producer.send(topic, value=data)
+        future.get(timeout=10)  # Wait for acknowledgment
+        return True
+    except KafkaError as e:
+        logger.error(f"Failed to send message to {topic}: {e}")
+        return False
+
+def main():
+    global producer, running
+    
+    # Setup signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        producer = create_producer()
+    except Exception as e:
+        logger.error(f"Cannot start producer: {e}")
+        sys.exit(1)
+
+    logger.info("🚀 Starting hybrid BESS data stream...")
+    msg_count = 0
+    failed_count = 0
+    
+    try:
+        while running:
+            device_num = random.randint(1, NUM_DEVICES)
             bess_data, is_realtime = generate_bess_data(device_num)
             
-            if is_realtime:
-                topic = REALTIME_TOPIC
-                print(f"SENDING TO REAL-TIME -> {bess_data['device_id']}: Freq={bess_data['grid_frequency']} Hz")
+            topic = REALTIME_TOPIC if is_realtime else ANALYTICS_TOPIC
+            log_msg = (f"→ {bess_data['device_id']}: "
+                      f"Freq={bess_data['grid_frequency']} Hz" if is_realtime
+                      else f"→ {bess_data['device_id']}: SoC={bess_data['soc']}%")
+            
+            if send_message(producer, topic, bess_data):
+                logger.info(f"{'REAL-TIME' if is_realtime else 'ANALYTICS'} {log_msg}")
+                msg_count += 1
             else:
-                topic = ANALYTICS_TOPIC
-                print(f"SENDING TO ANALYTICS -> {bess_data['device_id']}: SoC={bess_data['soc']}%")
-                
-            producer.send(topic, value=bess_data)
-            producer.flush()
+                failed_count += 1
             
-            msg_count += 1
-            time.sleep(5) 
+            time.sleep(MESSAGE_INTERVAL_SECONDS)
             
-    except KeyboardInterrupt:
-        print(f"\n🛑 Зупинено. Всього відправлено {msg_count} повідомлень.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
     finally:
-        producer.close()
-        print("🔌 З'єднання з Kafka закрито.")
+        logger.info(f"🛑 Stopped. Sent: {msg_count}, Failed: {failed_count}")
+        if producer:
+            producer.flush()
+            producer.close()
+            logger.info("🔌 Kafka connection closed")
 
 if __name__ == "__main__":
     main()
